@@ -39,7 +39,7 @@ grant usage on integration allow_all_access_integration to role DASH_CONTAINER_R
 -- TODO: Replace tlk_XXXXXXXXXXXXXXXXXX with your Twelve Labs API Key
 create secret twelve_labs_api
   TYPE = GENERIC_STRING
-  SECRET_STRING = 'tlk_XXXXXXXXXXXXXXXXXX';
+  SECRET_STRING = 'tlk_XXXXXXXXXXXXXXXX12';
 
 grant all on secret twelve_labs_api to role DASH_CONTAINER_RUNTIME_ROLE;
   
