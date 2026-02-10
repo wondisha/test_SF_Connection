@@ -1,0 +1,98 @@
+USE [msdb];
+GO
+
+-- Add the job
+EXEC dbo.sp_add_job
+    @job_name = N'AG Listener DNS Monitor',
+    @enabled = 1,
+    @description = N'Monitors AG listener DNS for stale IPs every 5 min using nslookup equivalent',
+    @start_step_id = 1,
+    @owner_login_name = N'sa';  -- Or your login
+
+-- Add the PowerShell step
+EXEC dbo.sp_add_jobstep
+    @job_name = N'AG Listener DNS Monitor',
+    @step_name = N'Check DNS Resolution',
+    @subsystem = N'PowerShell',
+    @command = N'
+# Load modules
+Import-Module FailoverClusters
+Import-Module SqlServer  # For Invoke-Sqlcmd; install if needed via NuGet
+
+# Parameters (customize these)
+$sqlServer = "."
+$database = "YourAGDB"  # An AG database name to check primary status
+$listenerName = "YourListener"  # AG listener DNS name
+$agName = "YourAGName"  # AG name
+$clusterName = "YourClusterName"  # Windows cluster name
+$dnsServer = ""  # Optional: Specific DNS server IP; leave empty for system default
+
+# Check if current replica is primary
+$isPrimaryQuery = "SELECT sys.fn_hadr_is_primary_replica(''$database'') AS IsPrimary"
+$isPrimary = Invoke-Sqlcmd -ServerInstance $sqlServer -Database master -Query $isPrimaryQuery
+
+if ($isPrimary.IsPrimary -ne 1) {
+    Write-Output "Not primary replica. Skipping."
+    exit 0
+}
+
+# Get RegisterAllProvidersIP value from cluster (to determine expected behavior)
+$networkNameResource = Get-ClusterResource -Cluster $clusterName | Where-Object { $_.Name -eq $listenerName -and $_.ResourceType -eq "Network Name" }
+$registerAll = $networkNameResource | Get-ClusterParameter RegisterAllProvidersIP | Select-Object -ExpandProperty Value
+
+# Get expected IP(s) from cluster
+$agGroup = Get-ClusterGroup -Cluster $clusterName -Name "Availability Group - $agName"
+$ipResources = $agGroup | Get-ClusterResource | Where-Object { $_.ResourceType -eq "IP Address" }
+$expectedIPs = @()
+if ($registerAll -eq 1) {
+    # Expect all configured IPs (online + offline)
+    $expectedIPs = $ipResources | ForEach-Object { $_ | Get-ClusterParameter Address | Select-Object -ExpandProperty Value }
+} else {
+    # Expect only the online IP
+    $onlineIPResource = $ipResources | Where-Object { $_.State -eq "Online" }
+    if ($onlineIPResource) {
+        $expectedIPs = @($onlineIPResource | Get-ClusterParameter Address | Select-Object -ExpandProperty Value)
+    } else {
+        throw "No online IP resource found for listener."
+    }
+}
+
+# Resolve DNS IPs (nslookup equivalent)
+$params = @{ Name = $listenerName; Type = "A" }
+if ($dnsServer) { $params.Server = $dnsServer }
+$resolved = Resolve-DnsName @params | Where-Object { $_.Type -eq "A" } | Select-Object -ExpandProperty IPAddress
+
+# Compare
+$resolvedIPs = $resolved | Sort-Object
+$expectedSorted = $expectedIPs | Sort-Object
+if (-not (Compare-Object $resolvedIPs $expectedSorted -SyncWindow 0)) {
+    Write-Output "DNS matches expected IPs: $expectedIPs"
+} else {
+    throw "Stale/mismatch DNS! Resolved: $resolvedIPs | Expected: $expectedIPs"
+}
+',
+    @retry_attempts = 0,
+    @retry_interval = 0,
+    @on_success_action = 1,  -- Quit with success
+    @on_fail_action = 2;     -- Quit with failure (triggers alert)
+
+-- Add schedule: Every 5 min
+EXEC dbo.sp_add_jobschedule
+    @job_name = N'AG Listener DNS Monitor',
+    @name = N'Every 5 Minutes',
+    @enabled = 1,
+    @freq_type = 4,  -- Daily
+    @freq_interval = 1,
+    @active_start_time = 000000,  -- Midnight
+    @freq_subday_type = 4,  -- Minutes
+    @freq_subday_interval = 5;  -- Every 5 min
+
+-- Add target server (current server; repeat on other replicas if needed)
+EXEC dbo.sp_add_jobserver @job_name = N'AG Listener DNS Monitor';
+
+-- Add alert notification (assumes operator 'DBAAlert' exists with email)
+EXEC dbo.sp_update_job
+    @job_name = N'AG Listener DNS Monitor',
+    @notify_level_email = 2,  -- On failure
+    @notify_email_operator_name = N'DBAAlert';  -- Your operator name
+GO
