@@ -1,0 +1,109 @@
+-- Run on central server
+CREATE TABLE dbo.AG_Listener_Monitor_Config (
+    MonitorID          INT IDENTITY(1,1) PRIMARY KEY,
+    AGName             NVARCHAR(128) NOT NULL,
+    ListenerName       NVARCHAR(128) NOT NULL,
+    ClusterName        NVARCHAR(128) NOT NULL,          -- e.g. 'PROD-CLUSTER-01'
+    PrimarySQLInstance NVARCHAR(128) NOT NULL,          -- e.g. 'SQLPROD01.domain.com' (any known replica)
+    AGDatabase         NVARCHAR(128) NOT NULL,          -- any database in the AG
+    DNSServer          NVARCHAR(64) NULL,               -- optional specific DNS server IP
+    Enabled            BIT DEFAULT 1
+);
+
+
+
+# Central monitoring script - runs on management server
+
+Import-Module FailoverClusters -ErrorAction Stop
+Import-Module SqlServer         # Ensure SqlServer module is installed/available
+
+# Get list of AGs to monitor
+$configs = Invoke-Sqlcmd -ServerInstance "." -Database "YourCentralDB" -Query "
+    SELECT AGName, ListenerName, ClusterName, PrimarySQLInstance, AGDatabase, DNSServer
+    FROM dbo.AG_Listener_Monitor_Config
+    WHERE Enabled = 1
+"
+
+$errors = @()
+
+foreach ($cfg in $configs) {
+    $ag        = $cfg.AGName
+    $listener  = $cfg.ListenerName
+    $cluster   = $cfg.ClusterName
+    $sqlInst   = $cfg.PrimarySQLInstance   # any replica - we will find primary
+    $db        = $cfg.AGDatabase
+    $dnsSrv    = $cfg.DNSServer ? $cfg.DNSServer : $null
+
+    try {
+        # Find current primary replica
+        $primaryQuery = @"
+SELECT 
+    ag.replica_server_name AS PrimaryReplica
+FROM sys.dm_hadr_availability_replica_states rs
+INNER JOIN sys.availability_groups ag ON rs.group_id = ag.group_id
+INNER JOIN sys.availability_replicas ar ON rs.replica_id = ar.replica_id
+    AND rs.group_id = ar.group_id
+WHERE ag.name = '$ag'
+    AND rs.role_desc = 'PRIMARY'
+"@
+        $primaryRow = Invoke-Sqlcmd -ServerInstance $sqlInst -Database master -Query $primaryQuery -ErrorAction Stop
+
+        if (-not $primaryRow) {
+            throw "No primary found for AG '$ag'"
+        }
+        $primaryServer = $primaryRow.PrimaryReplica
+
+        # Now query primary for RegisterAllProvidersIP and online IPs
+        # (alternative: query cluster directly - shown below)
+
+        # Option A: Query cluster remotely (preferred if permissions allow)
+        $agGroup = Get-ClusterGroup -Cluster $cluster -Name "Availability Group - $ag" -ErrorAction Stop
+
+        $netNameRes = Get-ClusterResource -Cluster $cluster | 
+            Where-Object { $_.OwnerGroup -eq $agGroup.Name -and $_.ResourceType -eq "Network Name" -and $_.Name -like "*$listener*" }
+
+        $registerAll = ($netNameRes | Get-ClusterParameter RegisterAllProvidersIP).Value
+
+        $ipResources = Get-ClusterResource -Cluster $cluster | 
+            Where-Object { $_.OwnerGroup -eq $agGroup.Name -and $_.ResourceType -eq "IP Address" }
+
+        $expectedIPs = @()
+        if ($registerAll -eq 1) {
+            $expectedIPs = $ipResources | ForEach-Object { ($_ | Get-ClusterParameter Address).Value }
+        } else {
+            $onlineIP = $ipResources | Where-Object { $_.State -eq "Online" }
+            if ($onlineIP) {
+                $expectedIPs = @(($onlineIP | Get-ClusterParameter Address).Value)
+            } else {
+                throw "No online IP for listener '$listener'"
+            }
+        }
+
+        # Resolve DNS
+        $dnsParams = @{ Name = $listener; Type = "A" }
+        if ($dnsSrv) { $dnsParams.Server = $dnsSrv }
+        $resolved = Resolve-DnsName @dnsParams | Where-Object { $_.Type -eq "A" } | Select-Object -ExpandProperty IPAddress
+
+        $resolvedSorted = $resolved | Sort-Object
+        $expectedSorted = $expectedIPs | Sort-Object
+
+        if (Compare-Object $resolvedSorted $expectedSorted) {
+            $errMsg = "Stale DNS for $listener (AG: $ag)! Resolved: $($resolved -join ', ') | Expected: $($expectedIPs -join ', ')"
+            $errors += $errMsg
+            Write-Output $errMsg
+        } else {
+            Write-Output "OK: $listener ($ag) DNS matches expected"
+        }
+    }
+    catch {
+        $errMsg = "Error monitoring $listener ($ag): $($_.Exception.Message)"
+        $errors += $errMsg
+        Write-Output $errMsg
+    }
+}
+
+if ($errors.Count -gt 0) {
+    throw "Monitoring found $($errors.Count) issues:`n$($errors -join "`n")"
+}
+
+Write-Output "All monitored listeners OK"
