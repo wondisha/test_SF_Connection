@@ -1,0 +1,149 @@
+# Central monitoring script using existing instance monitor table
+
+Import-Module FailoverClusters -ErrorAction Stop
+Import-Module SqlServer         # Ensure SqlServer module is installed/available
+
+Write-Output "Starting AG Listener DNS Monitor - $(Get-Date)"
+
+# Load seed instances from your existing table (adjust table/column names!)
+$seedQuery = @"
+SELECT 
+    InstanceName  -- Adjust to your column name, e.g., ServerName
+FROM YourInstanceMonitorDB.dbo.InstanceTable  -- Adjust DB and table name
+WHERE Enabled = 1  -- Optional: If you have an Enabled column
+"@
+$seeds = Invoke-Sqlcmd -ServerInstance "." -Query $seedQuery  # Use -ServerInstance "RemoteMonitorServer" if DB is elsewhere
+
+$rowCount = $seeds.Count
+Write-Output "Loaded $($rowCount) seed instances from instance monitor table."
+
+if ($rowCount -eq 0) {
+    Write-Output "WARNING: No instances found in table. Nothing to monitor."
+    exit 0
+}
+
+$errors = @()
+$monitoredListeners = @()
+
+foreach ($seedRow in $seeds) {
+    $inst = $seedRow.InstanceName  # Adjust to your column name
+    Write-Output "Querying seed instance: $inst"
+
+    try {
+        # Discover all AGs and listeners on this instance
+        $discoveryQuery = @"
+SELECT DISTINCT
+    ag.name AS AGName,
+    agl.dns_name AS ListenerName,
+    agl.port AS ListenerPort,  -- For logging/reference
+    (SELECT TOP 1 replica_server_name 
+     FROM sys.dm_hadr_availability_replica_states rs 
+     WHERE rs.group_id = ag.group_id AND rs.is_local = 1) AS LocalReplica,  -- For cluster guess
+    (SELECT TOP 1 database_name 
+     FROM sys.availability_databases_cluster adc 
+     WHERE adc.group_id = ag.group_id) AS AGDatabase  -- Pick one DB for primary check
+FROM sys.availability_groups ag
+LEFT JOIN sys.availability_group_listeners agl ON ag.group_id = agl.group_id
+WHERE agl.dns_name IS NOT NULL  -- Only AGs with listeners
+"@
+        $discovered = Invoke-Sqlcmd -ServerInstance $inst -Database master -Query $discoveryQuery -ErrorAction Stop
+
+        foreach ($row in $discovered) {
+            # Get cluster name (query sys.dm_os_cluster_nodes on the instance)
+            $clusterQuery = "SELECT TOP 1 ClusterName FROM sys.dm_os_cluster_nodes"
+            $clusterRow = Invoke-Sqlcmd -ServerInstance $inst -Database master -Query $clusterQuery
+            $clusterName = $clusterRow.ClusterName ? $clusterRow.ClusterName : "UnknownCluster"
+
+            $monitoredListeners += [PSCustomObject]@{
+                AGName            = $row.AGName
+                ListenerName      = $row.ListenerName
+                ClusterName       = $clusterName
+                PrimarySQLInstance= $inst  # Fallback; we'll find actual primary later
+                AGDatabase        = $row.AGDatabase ? $row.AGDatabase : "master"
+                DNSServer         = $null  # Optional; add a column to your table if needed
+            }
+        }
+    }
+    catch {
+        $errMsg = "Failed to discover AGs on $inst: $($_.Exception.Message)"
+        $errors += $errMsg
+        Write-Output $errMsg
+    }
+}
+
+# Now monitor each discovered listener
+foreach ($cfg in $monitoredListeners) {
+    Write-Output "Processing AG: $($cfg.AGName) | Listener: $($cfg.ListenerName) | Cluster: $($cfg.ClusterName)"
+
+    try {
+        # Find current primary replica (query any known replica)
+        $primaryQuery = @"
+SELECT 
+    ag.replica_server_name AS PrimaryReplica
+FROM sys.dm_hadr_availability_replica_states rs
+INNER JOIN sys.availability_groups ag ON rs.group_id = ag.group_id
+INNER JOIN sys.availability_replicas ar ON rs.replica_id = ar.replica_id
+    AND rs.group_id = ar.group_id
+WHERE ag.name = '$($cfg.AGName)'
+    AND rs.role_desc = 'PRIMARY'
+"@
+        $primaryRow = Invoke-Sqlcmd -ServerInstance $cfg.PrimarySQLInstance -Database master -Query $primaryQuery -ErrorAction Stop
+
+        if (-not $primaryRow) {
+            throw "No primary found for AG '$($cfg.AGName)'"
+        }
+        $primaryServer = $primaryRow.PrimaryReplica
+
+        # Get expected IPs from cluster
+        $agGroup = Get-ClusterGroup -Cluster $cfg.ClusterName -Name "Availability Group - $($cfg.AGName)" -ErrorAction Stop
+
+        $netNameRes = Get-ClusterResource -Cluster $cfg.ClusterName | 
+            Where-Object { $_.OwnerGroup -eq $agGroup.Name -and $_.ResourceType -eq "Network Name" -and $_.Name -like "*$($cfg.ListenerName)*" }
+
+        $registerAll = ($netNameRes | Get-ClusterParameter RegisterAllProvidersIP).Value
+
+        $ipResources = Get-ClusterResource -Cluster $cfg.ClusterName | 
+            Where-Object { $_.OwnerGroup -eq $agGroup.Name -and $_.ResourceType -eq "IP Address" }
+
+        $expectedIPs = @()
+        if ($registerAll -eq 1) {
+            $expectedIPs = $ipResources | ForEach-Object { ($_ | Get-ClusterParameter Address).Value }
+        } else {
+            $onlineIP = $ipResources | Where-Object { $_.State -eq "Online" }
+            if ($onlineIP) {
+                $expectedIPs = @(($onlineIP | Get-ClusterParameter Address).Value)
+            } else {
+                throw "No online IP for listener '$($cfg.ListenerName)'"
+            }
+        }
+
+        # Resolve DNS
+        $dnsParams = @{ Name = $cfg.ListenerName; Type = "A" }
+        if ($cfg.DNSServer) { $dnsParams.Server = $cfg.DNSServer }
+        $resolved = Resolve-DnsName @dnsParams | Where-Object { $_.Type -eq "A" } | Select-Object -ExpandProperty IPAddress
+
+        $resolvedSorted = $resolved | Sort-Object
+        $expectedSorted = $expectedIPs | Sort-Object
+
+        if (Compare-Object $resolvedSorted $expectedSorted) {
+            $errMsg = "Stale DNS for $($cfg.ListenerName) (AG: $($cfg.AGName))! Resolved: $($resolved -join ', ') | Expected: $($expectedIPs -join ', ')"
+            $errors += $errMsg
+            Write-Output $errMsg
+        } else {
+            Write-Output "OK: $($cfg.ListenerName) ($($cfg.AGName)) DNS matches expected"
+        }
+    }
+    catch {
+        $errMsg = "Error monitoring $($cfg.ListenerName) ($($cfg.AGName)): $($_.Exception.Message)"
+        $errors += $errMsg
+        Write-Output $errMsg
+    }
+}
+
+Write-Output "Monitoring complete - $(Get-Date)"
+
+if ($errors.Count -gt 0) {
+    throw "Monitoring found $($errors.Count) issues:`n$($errors -join "`n")"
+}
+
+Write-Output "All monitored listeners OK"
