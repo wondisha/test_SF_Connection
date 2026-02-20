@@ -1,0 +1,82 @@
+-- Run on the CENTRAL server
+USE AdminDB;   -- Create this DB first if it doesn't exist: CREATE DATABASE AdminDB;
+GO
+
+IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'TempUserAccess')
+BEGIN
+    CREATE TABLE dbo.TempUserAccess
+    (
+        ServerName     nvarchar(128) NOT NULL,          -- e.g. 'WONDI', 'SRV-PROD-01\INST2'
+        DatabaseName   nvarchar(128) NOT NULL,          -- e.g. 'demodb'
+        UserName       nvarchar(128) NOT NULL,
+        ExpirationDate datetime      NOT NULL,
+        CreatedBy      nvarchar(128) NULL,
+        CreatedDate    datetime      NULL DEFAULT GETDATE(),
+        Reason         nvarchar(500) NULL,
+        
+        CONSTRAINT PK_TempUserAccess PRIMARY KEY (ServerName, DatabaseName, UserName)
+    );
+    
+    PRINT 'Central TempUserAccess table created in AdminDB.';
+END
+GO
+
+INSERT INTO dbo.TempUserAccess (ServerName, DatabaseName, UserName, ExpirationDate, Reason)
+VALUES ('WONDI', 'demodb', 'temp_researcher', '2026-03-01', 'Project review access');
+
+
+--2--
+
+--powershell.exe -NoProfile -ExecutionPolicy Bypass -File "D:\execute_cleaning.ps1"
+
+# Clean dbatools import in Agent PowerShell step
+Import-Module dbatools -Force -ErrorAction Stop
+
+Set-DbatoolsInsecureConnection
+
+$centralInstance = "."
+$logFile = "D:\Admin\Logs\ExpiredUserCleanup_$(Get-Date -Format 'yyyyMMdd_HHmm').log"
+
+"Starting centralized cleanup at $(Get-Date)" | Out-File -FilePath $logFile -Append
+
+try {
+    $expired = Invoke-DbaQuery -SqlInstance $centralInstance -Database AdminDB -Query @'
+        SELECT ServerName, DatabaseName, UserName
+        FROM dbo.TempUserAccess
+        WHERE ExpirationDate < GETDATE();
+'@ -EnableException
+
+    if ($expired.Count -eq 0) {
+        "No expired temp users found." | Out-File -FilePath $logFile -Append
+    } else {
+        foreach ($row in $expired) {
+            $srv  = $row.ServerName
+            $db   = $row.DatabaseName
+            $user = $row.UserName
+
+            "Dropping user [$user] in [$db] on $srv" | Out-File -FilePath $logFile -Append
+
+            try {
+                Invoke-DbaQuery -SqlInstance $srv -Database $db -Query "DROP USER [$user];" -EnableException
+
+                Invoke-DbaQuery -SqlInstance $centralInstance -Database AdminDB -Query "
+                    DELETE FROM dbo.TempUserAccess
+                    WHERE ServerName   = '$srv'
+                      AND DatabaseName = '$db'
+                      AND UserName     = '$user';
+                " -EnableException
+
+                "Success: Removed [$user]" | Out-File -FilePath $logFile -Append
+            }
+            catch {
+                "ERROR on $srv\$db - $user : $($_.Exception.Message)" | Out-File -FilePath $logFile -Append
+            }
+        }
+        "Processed $($expired.Count) expired entries." | Out-File -FilePath $logFile -Append
+    }
+}
+catch {
+    "Critical job error: $($_.Exception.Message)" | Out-File -FilePath $logFile -Append
+}
+
+"Finished at $(Get-Date)" | Out-File -FilePath $logFile -Append
